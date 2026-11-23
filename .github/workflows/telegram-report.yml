@@ -1,10 +1,15 @@
 name: FTTx — сводка в Telegram
 
 on:
-  schedule:
-    - cron: "15 4 * * 1-6"    # пн–сб в 09:15 по Кызылорде (UTC+5)
-    - cron: "15 13 * * 1-6"   # пн–сб в 18:15 — итог дня
+  push:
+    branches: [main]
+    paths: [data.json]         # после каждого обновления данных из Qlik
   workflow_dispatch:           # ручной запуск: Actions → Run workflow
+
+# если data.json обновили два раза подряд — отправится только последняя сводка
+concurrency:
+  group: telegram-report
+  cancel-in-progress: true
 
 jobs:
   report:
