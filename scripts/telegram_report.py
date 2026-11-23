@@ -97,6 +97,8 @@ def message(M, site=""):
     today = pd(M["days"][T]); mon, monn = MON[today.month - 1], MONN[today.month - 1]
     as_of = D["asOf"][11:16]
     L = [f"<b>FTTx · новые установки на {dlabel(M['days'][T])}, {as_of}</b>"]
+    if D.get("forced"):
+        L.append(f"🔄 Обновлено по запросу: {html.escape(D['forced'])}")
 
     stale = datetime.now(TZ).replace(tzinfo=None) - datetime.fromisoformat(D["asOf"])
     if stale > timedelta(hours=STALE_HOURS):
@@ -273,10 +275,16 @@ def main():
             else:
                 cur = f"{cur}\n\n{block}" if cur else block
         parts.append(cur)
+        # кнопка под сводкой: нажатие ловит FTTx-бот в браузере (fttx-bot.user.js)
+        kb = [[{"text": "🔄 Обновить сейчас", "callback_data": "update"}]]
+        if site:
+            kb[0].append({"text": "Открыть сайт", "url": site})
         for cid in chat_ids:
-            for part in parts:
-                tg_call(token, "sendMessage", {"chat_id": cid, "text": part, "parse_mode": "HTML",
-                                               "disable_web_page_preview": True})
+            for i, part in enumerate(parts):
+                fields = {"chat_id": cid, "text": part, "parse_mode": "HTML", "disable_web_page_preview": True}
+                if i == len(parts) - 1:
+                    fields["reply_markup"] = {"inline_keyboard": kb}
+                tg_call(token, "sendMessage", fields)
             if xlsx:
                 tg_call(token, "sendDocument", {"chat_id": cid, "caption": "Сводка по РДТ и ОДТ + выполнено по дням"},
                         "document", xlsx)
