@@ -97,8 +97,6 @@ def message(M, site=""):
     today = pd(M["days"][T]); mon, monn = MON[today.month - 1], MONN[today.month - 1]
     as_of = D["asOf"][11:16]
     L = [f"<b>FTTx · новые установки на {dlabel(M['days'][T])}, {as_of}</b>"]
-    if D.get("forced"):
-        L.append(f"🔄 Обновлено по запросу из Telegram: {html.escape(D['forced'])}")
 
     stale = datetime.now(TZ).replace(tzinfo=None) - datetime.fromisoformat(D["asOf"])
     if stale > timedelta(hours=STALE_HOURS):
@@ -140,23 +138,6 @@ def message(M, site=""):
           table([("Прогноз", 8, lambda o: n(o["fc"])),
                  ("%", 6, lambda o: pct(o["fcPct"]))], tail=lambda o: band(o["fcPct"]))]
 
-    # ОДТ, которые не выполнят план
-    def odt_line(f):
-        return (f"{band(f['fcPct'])} {html.escape(f['fil'])} — {n(f['pct'] or 0)}% плана, "
-                f"прогноз {n(f['fcPct'])}%, нужно <b>{n(f['needDay'])}</b>/день")
-    low = sorted([f for f in M["fils"] if f["fcPct"] is not None and f["fcPct"] < 90], key=lambda f: f["fcPct"])
-    mid = sorted([f for f in M["fils"] if f["fcPct"] is not None and 90 <= f["fcPct"] < 100], key=lambda f: f["fcPct"])
-    ok = sum(1 for f in M["fils"] if f["fcPct"] is not None and f["fcPct"] >= 100)
-    if low:
-        L += ["", f"<b>Отстают — прогноз ниже 90% ({len(low)})</b>"] + [odt_line(f) for f in low]
-    if mid:
-        L += ["", f"<b>В зоне риска — 90–99% ({len(mid)})</b>"] + [odt_line(f) for f in mid]
-    L += ["", f"🟢 Выполнят план: {ok} из {len(M['fils'])} ОДТ"]
-
-    # самая большая чистая очередь
-    top = sorted(M["fils"], key=lambda f: -f["clean"])[:3]
-    L += ["", "<b>Больше всего в чистой очереди</b>: " +
-          ", ".join(f"{html.escape(f['fil'])} — {n(f['clean'])}" for f in top)]
     if site:
         L += ["", f'<a href="{html.escape(site)}">Открыть сайт</a>']
     return "\n".join(L)
@@ -292,16 +273,10 @@ def main():
             else:
                 cur = f"{cur}\n\n{block}" if cur else block
         parts.append(cur)
-        # кнопка под последней частью сводки: нажатие ловит scripts/telegram_listen.py
-        kb = [[{"text": "🔄 Обновить сейчас", "callback_data": "update"}]]
-        if site:
-            kb[0].append({"text": "Открыть сайт", "url": site})
         for cid in chat_ids:
-            for i, part in enumerate(parts):
-                fields = {"chat_id": cid, "text": part, "parse_mode": "HTML", "disable_web_page_preview": True}
-                if i == len(parts) - 1:
-                    fields["reply_markup"] = {"inline_keyboard": kb}
-                tg_call(token, "sendMessage", fields)
+            for part in parts:
+                tg_call(token, "sendMessage", {"chat_id": cid, "text": part, "parse_mode": "HTML",
+                                               "disable_web_page_preview": True})
             if xlsx:
                 tg_call(token, "sendDocument", {"chat_id": cid, "caption": "Сводка по РДТ и ОДТ + выполнено по дням"},
                         "document", xlsx)
