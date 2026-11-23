@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTTx-бот: обновление сайта из Qlik
 // @namespace    https://dinarazaiko.github.io/fttx-dashboard/
-// @version      1.0
+// @version      1.1
 // @description  Обновляет data.json сайта «Новые установки FTTx» после перезагрузки Qlik WFM и по кнопке «🔄 Обновить сейчас» в Telegram
 // @match        https://qtest/*
 // @grant        GM_getValue
@@ -13,15 +13,22 @@
 // @connect      api.github.com
 // @run-at       document-idle
 // @noframes
+// @updateURL    https://raw.githubusercontent.com/dinarazaiko/fttx-dashboard/main/fttx-bot.user.js
+// @downloadURL  https://raw.githubusercontent.com/dinarazaiko/fttx-dashboard/main/fttx-bot.user.js
 // ==/UserScript==
 
 /*
  Как это работает (держите в Chrome открытой любую вкладку https://qtest/…):
   • раз в 5 минут смотрит время перезагрузки WFM; если оно новее данных на сайте — собирает данные
     и кладёт data.json в GitHub (с 8:00 до 22:59);
-  • каждые ~30 секунд проверяет Telegram: кнопка «🔄 Обновить сейчас» или команда /update
-    из разрешённых чатов — сразу собирает последние данные и кладёт их в GitHub;
-  • коммит data.json запускает GitHub Action «FTTx — сводка в Telegram», он присылает сводку.
+  • слушает Telegram (команды — для администраторов из настроек и одобренных подписчиков):
+      /start   — новый участник просит доступ; администратор одобряет кнопкой, после этого
+                 участник получает все сводки и может пользоваться командами;
+      /svodka  — прислать сводку по последним данным только себе (≈1 минута);
+      /update  или кнопка «🔄 Обновить из Qlik» — забрать свежие данные из Qlik и прислать сводку себе;
+      /stop    — отписаться;  /help — список команд;
+  • коммит data.json запускает GitHub Action «FTTx — сводка в Telegram»: обычное обновление уходит
+    всем (TELEGRAM_CHAT_ID + subscribers.json), а запросы — только тому, кто спросил (поле sendTo).
  Работает в одной вкладке: если открыто несколько вкладок Qlik, остальные ждут.
  Настройки: значок Tampermonkey → «FTTx-бот: настройки».
 */
@@ -44,11 +51,11 @@
     if (gh) GM_setValue('ghToken', gh.trim());
     const tg = prompt('Токен Telegram-бота (как в секрете TELEGRAM_BOT_TOKEN). Пусто — не менять.', '');
     if (tg) GM_setValue('tgToken', tg.trim());
-    const ch = prompt('ID разрешённых чатов через запятую (как в секрете TELEGRAM_CHAT_ID):', GM_getValue('chatIds', ''));
+    const ch = prompt('ID чатов администратора через запятую (как в секрете TELEGRAM_CHAT_ID). Первый получает запросы на доступ:', GM_getValue('chatIds', ''));
     if (ch !== null) GM_setValue('chatIds', ch.trim());
     log('Настройки сохранены');
   });
-  GM_registerMenuCommand('FTTx-бот: обновить сейчас', () => runUpdate({ forced: 'вручную из браузера' }));
+  GM_registerMenuCommand('FTTx-бот: обновить сейчас (всем)', () => runUpdate({ forced: 'вручную из браузера' }));
 
   // ---------- значок состояния ----------
   const badge = document.createElement('div');
@@ -122,7 +129,7 @@
   async function wfmReloadTime() { const W = await qx(WFM); try { return ts(await W.ev("Timestamp(ReloadTime(),'YYYY-MM-DD hh:mm')")); } finally { W.close(); } }
 
   // ---------- сборка data.json (как extract_qlik.js + parse_qlik.py) ----------
-  async function buildData(forced) {
+  async function buildData(forced, sendTo) {
     const odt = n => REMAP[n] || n, ymd = d => d.toISOString().slice(0, 10);
     const W = await qx(WFM);
     let wf, asOf, lastEvent, createdAsOf, today;
@@ -190,6 +197,7 @@
       planRemap: 'Улытауская область → Карагандинская ОДТ, Жетысуская область → Алматинская ОДТ, Абайская область → Семипалатинск (по пулам WFM)',
       planPeriod: per[2], rows, days, daily, months, builtAt: built };
     if (forced) data.forced = forced;
+    if (sendTo) data.sendTo = String(sendTo);
     // проверка здравого смысла, как в parse_qlik.py
     const sum = k => rows.reduce((a, r) => a + (r[k] || 0), 0);
     if (rows.length < 15 || sum('total') <= 0 || sum('plan') <= 0) throw new Error(`странные данные: ОДТ ${rows.length}, очередь ${sum('total')}, план ${sum('plan')}`);
@@ -198,11 +206,11 @@
 
   // ---------- публикация в GitHub ----------
   async function siteAsOf() { const f = await gh('GET', 'contents/data.json?ref=main'); return { sha: f.sha, asOf: JSON.parse(unb64(f.content)).asOf }; }
-  async function publish(data, forced) {
+  async function publish(data, forced, message) {
     for (let attempt = 0; attempt < 3; attempt++) {
       const { sha } = await siteAsOf();
       try {
-        await gh('PUT', 'contents/data.json', { message: `Данные на ${data.asOf.replace('T', ' ')}${forced ? ' (по запросу из Telegram)' : ''}`,
+        await gh('PUT', 'contents/data.json', { message: message || `Данные на ${data.asOf.replace('T', ' ')}${forced ? ' (по запросу из Telegram)' : ''}`,
           content: b64(JSON.stringify(data)), sha, branch: 'main' });
         GM_setValue('publishedAsOf', data.asOf); return;
       } catch (e) { if (!/409|422/.test(e.message) || attempt === 2) throw e; }   // кто-то успел обновить — повторить
@@ -210,13 +218,13 @@
   }
 
   let busy = false;
-  async function runUpdate({ forced = null, chats = [] } = {}) {
+  async function runUpdate({ forced = null, chats = [], sendTo = null } = {}) {
     if (busy) { log('уже идёт обновление'); return; }
     if (!cfg().gh) { log('нет токена GitHub — откройте настройки'); return; }
     busy = true;
     try {
       log(forced ? `обновляю по запросу (${forced})…` : 'WFM перезагрузился — обновляю…');
-      const { data, summary } = await buildData(forced);
+      const { data, summary } = await buildData(forced, sendTo);
       await publish(data, !!forced);
       log(`опубликовано: ${summary}`);
     } catch (e) {
@@ -239,34 +247,121 @@
     } catch (e) { log('проверка WFM: ' + e.message); }
   }
 
-  // ---------- Telegram: кнопка «Обновить сейчас» и /update ----------
+  // ---------- подписчики (subscribers.json в репозитории: только числовые ID) ----------
+  let subs = null, subsSha = null, subsAt = 0;
+  async function loadSubs(force) {
+    if (!force && subs && Date.now() - subsAt < 600000) return subs;
+    try { const f = await gh('GET', 'contents/subscribers.json?ref=main'); subsSha = f.sha; subs = (JSON.parse(unb64(f.content)).subscribers || []).map(s => String(s.id)); }
+    catch (e) { if (/404/.test(e.message)) { subs = []; subsSha = null; } else throw e; }
+    subsAt = Date.now(); return subs;
+  }
+  async function saveSubs(list, message) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const body = { message, branch: 'main', content: b64(JSON.stringify({ subscribers: list.map(id => ({ id: Number(id) || id })) }, null, 1)) };
+        if (subsSha) body.sha = subsSha;
+        const r = await gh('PUT', 'contents/subscribers.json', body); subsSha = r.content.sha; subs = list; subsAt = Date.now(); return;
+      } catch (e) { if (!/409|422/.test(e.message) || attempt === 2) throw e; await loadSubs(true); list = [...new Set([...subs, ...list])]; }
+    }
+  }
+  const admins = () => cfg().chats.split(',').map(s => s.trim()).filter(Boolean);
+  async function isAllowed(chat) { return admins().includes(chat) || (await loadSubs()).includes(chat); }
+
+  // ---------- /svodka: последние данные — только запросившему ----------
+  async function sendSummaryTo(chat) {
+    const f = await gh('GET', 'contents/data.json?ref=main');
+    const data = JSON.parse(unb64(f.content));
+    delete data.forced; data.sendTo = chat;
+    data.builtAt = `${new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 10)}T${hm()}`;
+    await publish(data, false, `Сводка по запросу (данные на ${data.asOf.replace('T', ' ')})`);
+  }
+
+  const HELP = 'Команды бота FTTx:\n/svodka — сводка по последним данным (придёт через ~1 минуту)\n/update — забрать свежие данные из Qlik и прислать сводку (1–2 минуты)\n/stop — отписаться от рассылки\n/help — эта справка';
+  const send = (chat, text, extra) => tg('sendMessage', Object.assign({ chat_id: chat, text }, extra || {})).catch(e => log('Telegram: ' + e.message));
+
+  async function handle(u) {
+    const cb = u.callback_query, m = u.message;
+    if (cb) {
+      const chat = String(cb.message.chat.id), data = cb.data || '';
+      const ack = text => tg('answerCallbackQuery', { callback_query_id: cb.id, text }).catch(() => {});
+      if (data === 'update') {
+        if (!(await isAllowed(chat))) return ack('Нет доступа — отправьте боту /start');
+        if (busy) return ack('Обновление уже идёт');
+        ack('Обновляю…');
+        const who = cb.from.first_name || cb.from.username || '?';
+        send(chat, `⏳ Забираю последние данные из Qlik — сводка придёт через 1–2 минуты.`);
+        return runUpdate({ forced: `${who}, ${hm()}`, chats: [chat], sendTo: chat });
+      }
+      const mm = data.match(/^(approve|deny):(-?\d+)$/);
+      if (mm) {
+        if (!admins().includes(chat)) return ack('Одобрять может только администратор');
+        const id = mm[2], pend = GM_getValue('pending', {}); const name = (pend[id] || {}).name || id;
+        delete pend[id]; GM_setValue('pending', pend);
+        if (mm[1] === 'approve') {
+          const list = await loadSubs(true);
+          if (!list.includes(id)) await saveSubs([...list, id], 'Подписчик бота: добавлен');
+          ack('Доступ открыт');
+          tg('editMessageText', { chat_id: chat, message_id: cb.message.message_id, text: `✅ ${name} получил(а) доступ к сводкам` }).catch(() => {});
+          await send(id, '✅ Доступ открыт. Вы будете получать сводки FTTx после каждого обновления данных.\n\n' + HELP);
+          await sendSummaryTo(id).catch(e => log('сводка новому участнику: ' + e.message));
+        } else {
+          ack('Отклонено');
+          tg('editMessageText', { chat_id: chat, message_id: cb.message.message_id, text: `❌ Запрос ${name} отклонён` }).catch(() => {});
+          send(id, 'Запрос на доступ к сводкам FTTx отклонён.');
+        }
+      }
+      return;
+    }
+    if (!m || !m.text) return;
+    const chat = String(m.chat.id), txt = m.text.trim().toLowerCase().replace(/@\w+$/, '').replace(/@\w+\s/, ' ');
+    const from = m.from || {}, name = [from.first_name, from.last_name].filter(Boolean).join(' ') + (from.username ? ` (@${from.username})` : '');
+    const allowed = await isAllowed(chat);
+    if (/^\/start/.test(txt)) {
+      if (allowed) { await send(chat, 'Вы уже подключены к сводкам FTTx.\n\n' + HELP); return sendSummaryTo(chat); }
+      const pend = GM_getValue('pending', {});
+      if (pend[chat]) return send(chat, 'Запрос уже отправлен администратору — дождитесь одобрения.');
+      pend[chat] = { name: name || chat, at: Date.now() }; GM_setValue('pending', pend);
+      await send(chat, 'Здравствуйте! Бот присылает сводку по новым установкам FTTx. Запрос на доступ отправлен администратору — после одобрения придёт первая сводка.');
+      const kind = m.chat.type === 'private' ? '' : ` (чат «${m.chat.title || chat}»)`;
+      for (const a of admins().slice(0, 1)) await send(a, `🆕 ${name || 'Новый участник'}${kind} просит доступ к сводкам FTTx.`, {
+        reply_markup: { inline_keyboard: [[{ text: '✅ Разрешить', callback_data: `approve:${chat}` }, { text: '❌ Отклонить', callback_data: `deny:${chat}` }]] } });
+      return;
+    }
+    if (!allowed) return send(chat, 'Чтобы получать сводки FTTx, отправьте /start — запрос уйдёт администратору.');
+    if (/^\/(svodka|summary)|^сводка/.test(txt)) { await send(chat, '📊 Готовлю сводку по последним данным — придёт через ~1 минуту.'); return sendSummaryTo(chat); }
+    if (/^\/(update|obnovit)|^обнови/.test(txt)) {
+      if (busy) return send(chat, 'Обновление уже идёт — сводка скоро придёт.');
+      await send(chat, '⏳ Забираю последние данные из Qlik — сводка придёт через 1–2 минуты.');
+      return runUpdate({ forced: `${from.first_name || '?'}, ${hm()}`, chats: [chat], sendTo: chat });
+    }
+    if (/^\/stop/.test(txt)) {
+      if (admins().includes(chat)) return send(chat, 'Этот чат указан в настройках бота как основной — отключить его можно только в настройках.');
+      const list = await loadSubs(true);
+      await saveSubs(list.filter(x => x !== chat), 'Подписчик бота: отписался');
+      return send(chat, 'Вы отписались от сводок FTTx. Вернуться — /start.');
+    }
+    if (/^\/help/.test(txt)) return send(chat, HELP);
+  }
+
   async function pollTelegram() {
+    let menuSet = false;
     while (true) {
       try {
         const c = cfg();
-        if (!c.tg || !isLeader()) { await new Promise(r => setTimeout(r, 30000)); continue; }
-        const allowed = new Set(c.chats.split(',').map(s => s.trim()).filter(Boolean));
-        const offset = GM_getValue('tgOffset', 0);
-        const ups = await tg('getUpdates', { offset, timeout: 25, allowed_updates: ['message', 'callback_query'] }, 40000);
+        if (!c.tg || !c.gh || !isLeader()) { await new Promise(r => setTimeout(r, 30000)); continue; }
+        if (!menuSet) {
+          await tg('setMyCommands', { commands: [
+            { command: 'svodka', description: 'Сводка по последним данным' },
+            { command: 'update', description: 'Свежие данные из Qlik + сводка' },
+            { command: 'start', description: 'Подключиться к сводкам' },
+            { command: 'stop', description: 'Отписаться' },
+            { command: 'help', description: 'Справка' }] }).catch(() => {});
+          menuSet = true;
+        }
+        const ups = await tg('getUpdates', { offset: GM_getValue('tgOffset', 0), timeout: 25, allowed_updates: ['message', 'callback_query'] }, 40000);
         if (!ups.length) continue;
         GM_setValue('tgOffset', ups[ups.length - 1].update_id + 1);
-        const req = [];
-        for (const u of ups) {
-          const cb = u.callback_query, m = u.message;
-          if (cb && cb.data === 'update') {
-            const chat = String(cb.message.chat.id);
-            if (allowed.has(chat)) req.push({ chat, who: cb.from.first_name || cb.from.username || '?', cb: cb.id });
-            else tg('answerCallbackQuery', { callback_query_id: cb.id, text: 'Этот чат не может запускать обновление' }).catch(() => {});
-          } else if (m && /^\/(update|obnovit)|^обнови/i.test((m.text || '').trim()) && allowed.has(String(m.chat.id))) {
-            req.push({ chat: String(m.chat.id), who: (m.from || {}).first_name || '?' });
-          }
-        }
-        if (!req.length) continue;
-        const names = [...new Set(req.map(r => r.who))].join(', '), chats = [...new Set(req.map(r => r.chat))];
-        for (const r of req) if (r.cb) tg('answerCallbackQuery', { callback_query_id: r.cb, text: busy ? 'Обновление уже идёт' : 'Обновляю…' }).catch(() => {});
-        if (busy) continue;
-        for (const ch of chats) tg('sendMessage', { chat_id: ch, text: `⏳ Запрос от ${names} принят в ${hm()}. Забираю последние данные из Qlik — сводка придёт через 1–2 минуты.` }).catch(() => {});
-        await runUpdate({ forced: `${names}, ${hm()}`, chats });
+        for (const u of ups) { try { await handle(u); } catch (e) { log('Telegram-команда: ' + e.message); } }
       } catch (e) {
         log('Telegram: ' + e.message);
         await new Promise(r => setTimeout(r, 30000));
