@@ -1,6 +1,11 @@
 """Собирает data.json из компактной выгрузки сборщика (строки META/R/M/D)."""
 import json, sys, datetime as dt
-src, out = sys.argv[1], sys.argv[2]
+# Использование: python3 parse_qlik.py выгрузка.txt data.json [--forced "кто, когда"]
+args = sys.argv[1:]
+forced = None
+if '--forced' in args:
+    i = args.index('--forced'); forced = args[i + 1] if i + 1 < len(args) else 'да'; del args[i:i + 2]
+src, out = args[0], args[1]
 fix = lambda s: s[:10] + 'T' + s[11:] if len(s) > 10 else s
 meta = None; rows = []; months = []; D = {}
 for line in open(src, encoding='utf-8').read().strip().splitlines():
@@ -30,6 +35,11 @@ data = dict(source='Qlik Sense · WFM ДИР — Аналитика', asOf=asOf,
     planSource=f'Qlik Sense · Отчёт по продажам Core-услуги: Показатель «НУ ШПД», Услуга «FTTx», отчётный период {mo[-1]["key"].replace("-","")}',
     planRemap='Улытауская область → Карагандинская ОДТ, Жетысуская область → Алматинская ОДТ, Абайская область → Семипалатинск (по пулам WFM)',
     planPeriod=mo[-1]['key'], rows=rows, days=days, daily=daily, months=mo)
+# время сборки (Asia/Qyzylorda): при принудительном обновлении data.json меняется всегда,
+# поэтому GitHub Action отправит сводку, даже если Qlik с прошлого раза не перезагружался
+data['builtAt'] = dt.datetime.now(dt.timezone(dt.timedelta(hours=5))).strftime('%Y-%m-%dT%H:%M')
+if forced:
+    data['forced'] = forced
 json.dump(data, open(out, 'w', encoding='utf-8'), ensure_ascii=False, separators=(',', ':'))
 print('ok', asOf, 'odt', len(rows), 'days', len(days), 'total', sum(r['total'] for r in rows), 'clean', sum(r['clean'] for r in rows),
       'doneMonth', sum(r['doneMonth'] for r in rows), 'plan', sum(r['plan'] for r in rows),
