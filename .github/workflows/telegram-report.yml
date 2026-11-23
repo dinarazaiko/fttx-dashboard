@@ -1,0 +1,23 @@
+name: FTTx — сводка в Telegram
+
+on:
+  schedule:
+    - cron: "15 4 * * 1-6"    # пн–сб в 09:15 по Кызылорде (UTC+5)
+    - cron: "15 13 * * 1-6"   # пн–сб в 18:15 — итог дня
+  workflow_dispatch:           # ручной запуск: Actions → Run workflow
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install openpyxl
+      - name: Собрать и отправить сводку
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SITE_URL: https://dinarazaiko.github.io/fttx-dashboard/
+        run: python scripts/telegram_report.py --data data.json --send
