@@ -235,6 +235,8 @@ def main():
     ap.add_argument("--send", action="store_true", help="отправить в Telegram")
     ap.add_argument("--no-excel", action="store_true", help="не прикладывать Excel")
     ap.add_argument("--chat-ids", action="store_true", help="показать chat_id из последних сообщений боту")
+    ap.add_argument("--to", default="", help="отправить только в этот чат (запрос /svodka)")
+    ap.add_argument("--subscribers", default="subscribers.json", help="список подписчиков бота")
     a = ap.parse_args()
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip().strip('"\'')
     if token and not re.fullmatch(r"\d+:[A-Za-z0-9_-]{30,}", token):
@@ -252,7 +254,8 @@ def main():
             if ch: print(ch.get("id"), ch.get("type"), ch.get("title") or ch.get("username") or ch.get("first_name"))
         return
 
-    M = model(json.loads(Path(a.data).read_text(encoding="utf-8")))
+    D_raw = json.loads(Path(a.data).read_text(encoding="utf-8"))
+    M = model(D_raw)
     site = os.environ.get("SITE_URL", "").strip()
     msg = message(M, site)
     out = Path(a.out); out.mkdir(exist_ok=True)
@@ -264,7 +267,21 @@ def main():
     if xlsx: print(f"\nФайл: {xlsx}")
 
     if a.send:
-        chat_ids = [c.strip() for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if c.strip()]
+        # кому отправлять:
+        #  --to CHAT                  — только этому чату (команда /svodka);
+        #  data.json → sendTo         — только тому, кто нажал «Обновить» или прислал /svodka боту;
+        #  иначе                      — всем: TELEGRAM_CHAT_ID + подписчики из subscribers.json
+        if a.to.strip():
+            chat_ids = [a.to.strip()]
+        elif str(D_raw.get("sendTo", "")).strip():
+            chat_ids = [str(D_raw["sendTo"]).strip()]
+        else:
+            chat_ids = [c.strip() for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if c.strip()]
+            sp = Path(a.subscribers)
+            if sp.exists():
+                for s in json.loads(sp.read_text(encoding="utf-8")).get("subscribers", []):
+                    if str(s.get("id")) not in chat_ids:
+                        chat_ids.append(str(s["id"]))
         if not token or not chat_ids:
             sys.exit("Нужны переменные TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID")
         # лимит Telegram — 4096 символов: режем по пустым строкам (таблицы <pre> не разрываются)
@@ -276,10 +293,12 @@ def main():
                 cur = f"{cur}\n\n{block}" if cur else block
         parts.append(cur)
         # кнопка под сводкой: нажатие ловит FTTx-бот в браузере (fttx-bot.user.js)
-        kb = [[{"text": "🔄 Обновить сейчас", "callback_data": "update"}]]
+        kb = [[{"text": "🔄 Обновить из Qlik", "callback_data": "update"}]]
         if site:
             kb[0].append({"text": "Открыть сайт", "url": site})
+        failed = []
         for cid in chat_ids:
+          try:
             for i, part in enumerate(parts):
                 fields = {"chat_id": cid, "text": part, "parse_mode": "HTML", "disable_web_page_preview": True}
                 if i == len(parts) - 1:
@@ -288,7 +307,13 @@ def main():
             if xlsx:
                 tg_call(token, "sendDocument", {"chat_id": cid, "caption": "Сводка по РДТ и ОДТ + выполнено по дням"},
                         "document", xlsx)
-        print("Отправлено в чаты:", ", ".join(chat_ids))
+          except Exception as e:          # один заблокировавший бота подписчик не должен ломать рассылку
+            failed.append(f"{cid}: {e}")
+        print("Отправлено в чаты:", ", ".join(c for c in chat_ids if not any(f.startswith(c + ":") for f in failed)))
+        if failed:
+            print("Не доставлено:", *failed, sep="\n  ")
+            if len(failed) == len(chat_ids):
+                sys.exit(1)
 
 
 if __name__ == "__main__":
