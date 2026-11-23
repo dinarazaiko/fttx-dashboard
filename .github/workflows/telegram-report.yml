@@ -3,13 +3,15 @@ name: FTTx — сводка в Telegram
 on:
   push:
     branches: [main]
-    paths: [data.json]         # после каждого обновления данных из Qlik
-  workflow_dispatch:           # ручной запуск: Actions → Run workflow
+    paths: [data.json]         # после каждого обновления данных из Qlik — всем подписчикам
+  workflow_dispatch:           # ручной запуск: Actions → Run workflow (всем) или из FTTx-бота (одному чату)
+    inputs:
+      chat_id:
+        description: "ID чата, если сводку нужно отправить только ему (пусто — всем)"
+        required: false
+        default: ""
 
-# если data.json обновили два раза подряд — отправится только последняя сводка
-concurrency:
-  group: telegram-report
-  cancel-in-progress: true
+# Без отмены параллельных запусков: сводки по запросу разных людей не должны отменять друг друга.
 
 jobs:
   report:
@@ -25,4 +27,5 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SITE_URL: https://dinarazaiko.github.io/fttx-dashboard/
-        run: python scripts/telegram_report.py --data data.json --send
+          TO_CHAT: ${{ github.event.inputs.chat_id }}
+        run: python scripts/telegram_report.py --data data.json --send --to "$TO_CHAT"
