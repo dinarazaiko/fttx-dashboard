@@ -1,7 +1,8 @@
 // Сборщик data.json для сайта «Новые установки FTTx».
 // Запускается в любой вкладке https://qtest/... (нужна действующая сессия Qlik).
 // Работает напрямую с движком Qlik по WebSocket, интерфейс листа не нужен.
-// Результат: window.__fttx (объект) и window.__fttxGz (base64 от gzip JSON) для выгрузки частями.
+// Результат: window.__fttx (объект) и window.__ch (массив строк для parse_qlik.py; читать по одному элементу).
+// Перед запуском можно проверить время перезагрузки WFM: выражение ReloadTime() в приложении WFM (см. asOf в data.json).
 await (async () => {
   const WFM = '49bbf2a0-a537-400e-8e47-2d311df1f1e9';
   const SALES = 'e1e154eb-0977-4e66-8526-ad52a159a455';
@@ -115,10 +116,15 @@ await (async () => {
     planPeriod: per[2], rows, days, daily, months
   };
   window.__fttx = data;
-  const gz = await new Response(new Blob([JSON.stringify(data)]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer();
-  let s = ''; new Uint8Array(gz).forEach(b => s += String.fromCharCode(b));
-  window.__fttxGz = btoa(s);
-  return { asOf, salesReload, cut, odt: rows.length, days: days.length, gzLen: window.__fttxGz.length,
+  // Компактная выгрузка для parse_qlik.py: строки META/R/M/D, кусками до ~850 символов (window.__ch[i])
+  const F = rows.map(r => r.fil), L = [];
+  L.push('META|' + [asOf, lastEvent, createdAsOf, salesReload, cut, days[0], days.at(-1)].join('|'));
+  rows.forEach(r => L.push('R|' + [r.rdt, r.fil, r.total, r.clean, r.createdToday, r.doneToday, r.doneYesterday, r.doneMonth, r.plan, r.salesFact].join('|')));
+  months.forEach(m => L.push('M|' + m.key + '|' + F.map(f => (m.plan[f] || 0) + ':' + (m.done[f] || 0)).join(',')));
+  F.forEach((f, i) => L.push('D|' + i + '|' + daily[f].join(',')));
+  const ch = []; let cur = ''; L.forEach(l => { if ((cur + l).length > 850) { ch.push(cur); cur = ''; } cur += l + '\n'; }); ch.push(cur);
+  window.__ch = ch;
+  return { asOf, salesReload, cut, odt: rows.length, days: days.length, chunks: ch.length,
            total: rows.reduce((a, r) => a + r.total, 0), clean: rows.reduce((a, r) => a + r.clean, 0),
            doneMonth: rows.reduce((a, r) => a + r.doneMonth, 0), plan: rows.reduce((a, r) => a + r.plan, 0) };
 })()
