@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTTx-бот: обновление сайта из Qlik
 // @namespace    https://dinarazaiko.github.io/fttx-dashboard/
-// @version      1.1
+// @version      1.2
 // @description  Обновляет data.json сайта «Новые установки FTTx» после перезагрузки Qlik WFM и по кнопке «🔄 Обновить сейчас» в Telegram
 // @match        https://qtest/*
 // @grant        GM_getValue
@@ -42,7 +42,8 @@
   const REMAP = { 'Абайская область': 'Семипалатинск', 'Жетысуская область': 'Алматинская ОДТ', 'Улытауская область': 'Карагандинская ОДТ' };
   const AUTO_FROM = 8, AUTO_TO = 22;                         // авто-обновления с 8:00 до 22:59 по времени ноутбука
   const WFM_CHECK_MS = 5 * 60 * 1000;
-  const TAB = Math.random().toString(36).slice(2);
+  const TAB = (() => { try { let v = sessionStorage.getItem('fttxBotTab'); if (!v) { v = Math.random().toString(36).slice(2); sessionStorage.setItem('fttxBotTab', v); } return v; } catch (e) { return Math.random().toString(36).slice(2); } })();
+  const QLIK_LOST = 'нет соединения с Qlik';
 
   // ---------- настройки ----------
   const cfg = () => ({ gh: GM_getValue('ghToken', ''), tg: GM_getValue('tgToken', ''), chats: GM_getValue('chatIds', '') });
@@ -109,7 +110,7 @@
     const ws = new WS(`wss://${location.host}/app/${appId}?reloadUri=x`);
     let id = 0; const pend = {};
     ws.onmessage = e => { const j = JSON.parse(e.data); if (j.id && pend[j.id]) { j.error ? pend[j.id].rej(new Error(j.error.message || 'Qlik')) : pend[j.id].res(j.result); delete pend[j.id]; } };
-    await new Promise((r, j) => { ws.onopen = r; ws.onerror = () => j(new Error('нет соединения с Qlik — проверьте вход в Qlik')); setTimeout(() => j(new Error('Qlik не ответил')), 30000); });
+    await new Promise((r, j) => { ws.onopen = r; ws.onerror = () => j(new Error(QLIK_LOST)); setTimeout(() => j(new Error(QLIK_LOST + ' (таймаут)')), 30000); });
     const call = (h, m, p) => new Promise((res, rej) => { const i = ++id; pend[i] = { res, rej }; ws.send(JSON.stringify({ jsonrpc: '2.0', id: i, handle: h, method: m, params: p })); setTimeout(() => { if (pend[i]) { delete pend[i]; rej(new Error('Qlik: таймаут ' + m)); } }, 120000); });
     const doc = (await call(-1, 'OpenDoc', [appId])).qReturn.qHandle;
     const ev = async ex => (await call(doc, 'Evaluate', [ex])).qReturn;
@@ -217,6 +218,18 @@
     }
   }
 
+  // Сессия Qlik истекла (например, вкладка открыта со вчера): перезагружаем вкладку без старого qlikTicket —
+  // вход происходит заново автоматически, а отложенный запрос выполняется сразу после перезагрузки.
+  function relogin(pending) {
+    const last = GM_getValue('lastRelogin', 0);
+    if (Date.now() - last < 10 * 60000) return false;            // не чаще раза в 10 минут — защита от цикла
+    GM_setValue('lastRelogin', Date.now());
+    if (pending) GM_setValue('pendingRun', Object.assign({ at: Date.now() }, pending));
+    log('сессия Qlik истекла — перезахожу в Qlik…');
+    setTimeout(() => { location.href = location.origin + location.pathname; }, 1500);
+    return true;
+  }
+
   let busy = false;
   async function runUpdate({ forced = null, chats = [], sendTo = null } = {}) {
     if (busy) { log('уже идёт обновление'); return; }
@@ -229,7 +242,8 @@
       log(`опубликовано: ${summary}`);
     } catch (e) {
       log('ошибка: ' + e.message);
-      for (const c of chats) { try { await tg('sendMessage', { chat_id: c, text: `⚠️ Не удалось обновить данные: ${e.message}` }); } catch (_) {} }
+      if (e.message.startsWith(QLIK_LOST) && relogin({ forced, chats, sendTo })) return;   // повторим после перевхода
+      for (const c of chats) { try { await tg('sendMessage', { chat_id: c, text: `⚠️ Не удалось обновить данные: ${e.message}. Проверьте, что ноутбук включён и в Chrome открыт Qlik.` }); } catch (_) {} }
     } finally { busy = false; }
   }
 
@@ -244,7 +258,7 @@
       if (!pub) { pub = (await siteAsOf()).asOf; GM_setValue('publishedAsOf', pub); }
       if (rt > pub) await runUpdate({});
       else setHead(`данные актуальны (WFM ${rt.slice(11)}), проверка в ${new Date(Date.now() + WFM_CHECK_MS).toTimeString().slice(0, 5)}`);
-    } catch (e) { log('проверка WFM: ' + e.message); }
+    } catch (e) { log('проверка WFM: ' + e.message); if (e.message.startsWith(QLIK_LOST)) relogin(null); }
   }
 
   // ---------- подписчики (subscribers.json в репозитории: только числовые ID) ----------
@@ -371,7 +385,12 @@
 
   // ---------- старт ----------
   setHead(cfg().gh ? 'запущен' : 'нет настроек — значок Tampermonkey → «FTTx-бот: настройки»');
-  setTimeout(checkWfm, 15000); setInterval(checkWfm, WFM_CHECK_MS);
+  setTimeout(async () => {
+    const p = GM_getValue('pendingRun', null);
+    if (p) { GM_setValue('pendingRun', null); if (Date.now() - p.at < 15 * 60000 && isLeader()) { log('перезашла в Qlik — выполняю отложенный запрос'); await runUpdate(p); } }
+    checkWfm();
+  }, 8000);
+  setInterval(checkWfm, WFM_CHECK_MS);
   setInterval(() => { if (GM_getValue('leader', {}).tab === TAB) GM_setValue('leader', { tab: TAB, ts: Date.now() }); }, 30000);
   pollTelegram();
 })();
