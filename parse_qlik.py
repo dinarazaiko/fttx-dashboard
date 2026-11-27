@@ -6,7 +6,14 @@ forced = None
 if '--forced' in args:
     i = args.index('--forced'); forced = args[i + 1] if i + 1 < len(args) else 'да'; del args[i:i + 2]
 src, out = args[0], args[1]
-fix = lambda s: s[:10] + 'T' + s[11:] if len(s) > 10 else s
+def fix(s):
+    """YYYY-MM-DD?hh:mm -> YYYY-MM-DDThh:mm. Qlik иногда отдаёт 12-часовое время с A/P на месте T
+    (2026-11-27P03:31 = 15:31) — переводим в 24-часовое."""
+    if len(s) <= 10: return s
+    sep, hh = s[10], int(s[11:13])
+    if sep == 'P' and hh < 12: hh += 12
+    elif sep == 'A' and hh == 12: hh = 0
+    return f'{s[:10]}T{hh:02d}{s[13:]}' if sep in 'AP' else s[:10] + 'T' + s[11:]
 meta = None; rows = []; months = []; D = {}
 for line in open(src, encoding='utf-8').read().strip().splitlines():
     p = line.split('|')
